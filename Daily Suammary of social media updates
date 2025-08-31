@@ -1,0 +1,248 @@
+"""
+Social Media News Aggregator
+----------------------------
+
+Pulls daily updates from multiple social media sources (X/Twitter, Reddit, YouTube)
+plus optional RSS news feeds, summarizes them, de-duplicates, lightly clusters by
+keywords, and writes a clean Markdown daily brief and a CSV of the raw items.
+
+▶ How to use (quick start)
+1) Install Python 3.9+
+2) `pip install -r requirements.txt` (see REQUIREMENTS below)
+3) Create a `.env` file next to this script with your API keys (see ENV VARS below)
+4) Edit the `CONFIG` section to choose accounts, subreddits, channels, and feeds.
+5) Run: `python social_media_news_aggregator.py`
+
+Outputs (in ./out/):
+  - daily_brief_YYYY-MM-DD.md  → readable summary
+  - items_YYYY-MM-DD.csv       → raw collected items
+
+Scheduling:
+  - Linux/macOS: add to crontab; Windows: Task Scheduler. (Examples at bottom.)
+
+LEGAL / ETHICS / TOS
+  - Prefer official APIs. Respect each platform's terms, rate limits, and user privacy.
+  - This script uses *official* client libraries where available and simple RSS for news.
+  - Do not collect or republish personal data beyond fair use / news citation norms.
+
+REQUIREMENTS (pip):
+  python-dotenv
+  tweepy
+  praw
+  google-api-python-client
+  youtube-transcript-api
+  feedparser
+  newspaper3k
+  beautifulsoup4
+  lxml
+  pandas
+  transformers
+  torch
+  nltk
+
+Create a requirements.txt with exactly the above lines, or install ad hoc.
+
+ENV VARS (.env file):
+  # X/Twitter API v2 (Essential access or higher)
+  TWITTER_BEARER_TOKEN=...
+
+  # Reddit API (https://www.reddit.com/prefs/apps)
+  REDDIT_CLIENT_ID=...
+  REDDIT_CLIENT_SECRET=...
+  REDDIT_USER_AGENT=yourapp/1.0 by your_reddit_username
+
+  # YouTube Data API v3 (https://console.cloud.google.com)
+  YOUTUBE_API_KEY=...
+
+"""
+from __future__ import annotations
+
+import os
+import re
+import csv
+import json
+import math
+import time
+import hashlib
+import logging
+import textwrap
+import datetime as dt
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Iterable, Tuple
+
+# --- Third-party imports ---
+from dotenv import load_dotenv
+import pandas as pd
+
+# Optional imports are handled inside functions to allow partial usage
+
+# -----------------------
+# Configuration
+# -----------------------
+
+TODAY = dt.date.today().isoformat()
+OUT_DIR = os.path.join(os.path.dirname(__file__), "out")
+
+CONFIG = {
+    "twitter": {
+        # Tweets from these accounts (usernames without @)
+        "accounts": [
+            "BBCWorld", "Reuters", "AP", "AlJazeera", "cnnbrk",
+            # local/regional handles can be added here
+        ],
+        # Optional keywords for recent search; keep short to avoid noise
+        "keywords": ["breaking", "developing", "election", "strike", "earthquake", "Nigeria"],
+        "max_per_account": 10,
+        "max_search_hits": 30,
+        "lang": "en",
+        # Only tweets from the last N hours
+        "lookback_hours": 24,
+        # Exclude retweets/replies for cleaner feed
+        "exclude_rt": True,
+        "exclude_replies": True,
+    },
+    "reddit": {
+        # Choose newsy subs; add country-specific subs if desired
+        "subreddits": ["news", "worldnews", "technology", "Nigeria"],
+        "limit_per_sub": 25,
+        # "hot", "new", or "top"
+        "listing": "top",
+        # Only posts from last N hours
+        "lookback_hours": 24,
+        # Minimum score to filter noise
+        "min_score": 50,
+    },
+    "youtube": {
+        # Channel IDs (not handles). Convert @handle → channel id with a quick one-off lookup.
+        # Examples (validate for your needs):
+        "channels": [
+            "UC16niRr50-MSBwiO3YDb3RA",  # BBC News
+            "UChqUt3k5_3gRdiH0nJmVH1A",  # Al Jazeera English
+            "UCupvZG-5ko_eiXAupbDfxWw",  # CNN
+            "UCBi2mrWuNuyYy4gbM6fU18Q",  # ABC News
+        ],
+        # Keywords to search globally (optional)
+        "keywords": ["breaking news", "Nigeria news", "Africa news"],
+        "max_per_channel": 10,
+        "max_search_hits": 20,
+        "lookback_hours": 24,
+    },
+    "rss": {
+        "feeds": [
+            "http://feeds.bbci.co.uk/news/rss.xml",
+            "https://www.reutersagency.com/feed/?best-topics=top-news",
+            "https://www.aljazeera.com/xml/rss/all.xml",
+            "https://apnews.com/hub/ap-top-news?utm_source=apnews.com&utm_medium=referral&utm_campaign=apnews_homepage&output=rss",
+        ],
+        "max_per_feed": 20,
+        "lookback_hours": 24,
+    },
+    # Summarization options
+    "summary": {
+        "max_chars": 900,  # target length for each item summary
+        "model": "facebook/bart-large-cnn",  # requires ~1.6GB download first time
+        "min_len": 60,
+        "max_len": 200,
+    },
+    # Topic grouping (very light)
+    "grouping": {
+        "top_k_keywords": 8,
+    },
+}
+
+# -----------------------
+# Utilities
+# -----------------------
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+def ensure_out_dir() -> None:
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def load_env() -> None:
+    load_dotenv()
+
+
+def safe_getenv(key: str) -> Optional[str]:
+    v = os.getenv(key, "").strip()
+    return v or None
+
+
+@dataclass
+class Item:
+    source: str
+    id: str
+    title: str
+    url: str
+    text: str
+    published_at: str  # ISO 8601
+    author: Optional[str] = None
+    score: Optional[int] = None
+
+    def key(self) -> str:
+        base = f"{self.source}|{self.url or self.id}"
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+# -----------------------
+# Fetchers
+# -----------------------
+
+
+def fetch_twitter(config: Dict) -> List[Item]:
+    token = safe_getenv("TWITTER_BEARER_TOKEN")
+    if not token:
+        logging.warning("TWITTER_BEARER_TOKEN not set; skipping Twitter.")
+        return []
+
+    import tweepy
+
+    client = tweepy.Client(bearer_token=token, wait_on_rate_limit=True)
+    lookback = dt.datetime.utcnow() - dt.timedelta(hours=config.get("lookback_hours", 24))
+    start_time = lookback.replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    items: List[Item] = []
+
+    # From accounts
+    user_fields = ["username", "name"]
+    tweet_fields = ["created_at", "lang", "public_metrics", "referenced_tweets"]
+
+    for username in config.get("accounts", []):
+        try:
+            user = client.get_user(username=username, user_fields=user_fields).data
+            if not user:
+                continue
+            exclude = []
+            if config.get("exclude_rt", True):
+                exclude.append("retweets")
+            if config.get("exclude_replies", True):
+                exclude.append("replies")
+
+            tweets = client.get_users_tweets(
+                id=user.id,
+                max_results=min(100, config.get("max_per_account", 10)),
+                start_time=start_time,
+                tweet_fields=tweet_fields,
+                exclude=exclude or None,
+            ).data or []
+
+            for t in tweets:
+                if config.get("lang") and t.lang and t.lang != config["lang"]:
+                    continue
+                metrics = t.public_metrics or {}
+                items.append(
+                    Item(
+                        source="twitter",
+                        id=str(t.id),
+                        title=t.text.split("\n")[0][:140],
+                        url=f"https://twitter.com/{username}/status/{t.id}",
+                        text=t.text,
+                        published_at=t.created_at.isoformat() if t.created_at else TODAY,
+                        author=username,
+                        score=int(metrics.get("like_count", 0) + metrics.get("retweet_count", 0)),
+                    )
+                )
+        except Exception as e:
+            logging.error(f"Twitter account fetch failed for @{username}: {e}")
